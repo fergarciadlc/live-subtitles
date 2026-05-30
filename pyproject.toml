@@ -1,0 +1,38 @@
+[project]
+name = "live-subtitles"
+version = "0.1.0"
+description = "Browser-based live captioning: EN/FR speech -> transcription -> translation. Server-side, swappable ASR."
+requires-python = ">=3.11,<3.13"
+
+# --- pixi (local dev environment manager) ---
+# Deploy target is HF Spaces free CPU (linux-64); osx-arm64 is the dev machine.
+# faster-whisper / CTranslate2 is CPU-only on both, so dev and deploy latency are comparable.
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64"]
+
+[tool.pixi.dependencies]
+python = "3.12.*"
+# PyAV from conda-forge (prebuilt) so it isn't compiled against the system ffmpeg,
+# which fails on Homebrew ffmpeg 7. pixi maps it to satisfy the PyPI solve.
+av = "*"
+# Mic capture (slice 1b). conda-forge ships PortAudio prebuilt with the bindings.
+python-sounddevice = "*"
+numpy = "*"
+
+[tool.pixi.pypi-dependencies]
+# faster-whisper + ctranslate2 ship prebuilt PyPI wheels (no compile); av is satisfied above.
+faster-whisper = "*"
+
+[tool.pixi.tasks]
+# Throwaway vertical-slice tasks (build-order step 1) — remove once the real pipeline lands.
+slice-1a = "python slice_1a.py"
+slice-1b = "python slice_1b.py"
+
+# Test feature kept ready for the deterministic core (step 5); not used by the slice.
+[tool.pixi.feature.test.dependencies]
+pytest = "*"
+
+[tool.pixi.environments]
+default = { solve-group = "default" }
+test = { features = ["test"], solve-group = "default" }

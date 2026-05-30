@@ -1,0 +1,22 @@
+# pixi
+.pixi/
+*.lock.bak
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# models / caches
+.cache/
+*.bin
+
+# local audio (don't commit large media; clips/ tracked selectively later)
+*.wav
+*.mp3
+*.m4a
+*.flac
+
+# OS
+.DS_Store
