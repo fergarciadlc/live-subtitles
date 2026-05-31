@@ -1,0 +1,1 @@
+Live subtitles should keep up with natural speech in real time.
