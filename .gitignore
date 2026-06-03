@@ -11,6 +11,8 @@ __pycache__/
 # models / caches
 .cache/
 *.bin
+# converted Opus-MT models (build with: pixi run -e convert convert-mt)
+models/
 
 # local audio (don't commit large media; clips/ tracked selectively later)
 *.wav

@@ -13,10 +13,17 @@ What to watch:
 Why it's structured this way: re-transcribing the whole phrase on CPU is expensive,
 so we (a) drain the mic queue every loop to stay real-time, (b) only do work once per
 ~STEP seconds of audio, and (c) throttle the live preview. The pause commit always
-runs a final clean transcription. translate.py is step 6 — `fake_translate` is a STUB.
+runs a final clean transcription, then real Opus-MT translation (src/translate.py).
+Build the MT models first: pixi run -e convert convert-mt
 
-Usage:  python slice_2.py [--lang en] [--pause 0.6] [--model small] [--no-interim]
-        (Ctrl+C to stop)
+Adaptive endpointing: a single pause threshold can't serve both choppy and fluent
+speech (too short fragments mid-clause; too long lets continuous speech balloon into
+paragraph-sized, laggy commits). So we commit on a normal pause, OR at a *shorter*
+gap once a phrase has run long, OR at a hard cap — whichever comes first. That keeps
+phrases complete yet bounded.
+
+Usage:  python slice_2.py [--lang en] [--pause 0.5] [--max 7] [--model small]
+        [--no-interim]   (Ctrl+C to stop)
 """
 
 import queue
@@ -29,30 +36,30 @@ from faster_whisper import WhisperModel
 
 from src.audio import SAMPLE_RATE, detect_speech, prepare
 from src.captions import CaptionState
+from src.translate import translate
 
 CHANNELS = 1
 COMPUTE_TYPE = "int8"  # CPU-only path
 STEP_SECONDS = 0.4  # do VAD/ASR work once per this much accumulated audio
 INTERIM_EVERY = 1.0  # re-transcribe the live preview at most this often (CPU budget)
-MAX_PHRASE_SECONDS = 15.0  # force a commit if someone never pauses (bounds cost)
+SOFT_MAX_SECONDS = 4.0  # past this, a phrase is "long" — commit at the shorter gap
+SHORT_PAUSE = 0.2  # the reduced pause used once a phrase is long (fluent speech)
 
 
-def parse_args() -> tuple[str | None, float, str, bool]:
+def parse_args() -> tuple[str | None, float, float, str, bool]:
     lang = next((a.split("=")[-1] for a in sys.argv[1:] if a.startswith("--lang")), None)
-    pause = next((float(a.split("=")[-1]) for a in sys.argv[1:] if a.startswith("--pause")), 0.6)
+    pause = next((float(a.split("=")[-1]) for a in sys.argv[1:] if a.startswith("--pause")), 0.5)
+    max_phrase = next((float(a.split("=")[-1]) for a in sys.argv[1:] if a.startswith("--max")), 7.0)
     model = next((a.split("=")[-1] for a in sys.argv[1:] if a.startswith("--model")), "small")
     interim = "--no-interim" not in sys.argv[1:]
-    return lang, pause, model, interim
-
-
-def fake_translate(text: str, lang: str | None) -> str:
-    """STUB for translate.py (step 6). Real version is Opus-MT; this just marks the flow."""
-    target = "fr" if lang == "en" else "en"
-    return f"[{target}: {text}]"
+    return lang, pause, max_phrase, model, interim
 
 
 def main() -> None:
-    lang, pause_seconds, model_size, show_interim = parse_args()
+    lang, pause_seconds, max_phrase_seconds, model_size, show_interim = parse_args()
+    # Translation needs an explicit source; with --lang auto we assume EN source.
+    src_lang = lang or "en"
+    tgt_lang = "fr" if src_lang == "en" else "en"
     print(f"Loading faster-whisper '{model_size}' (CPU)...")
     model = WhisperModel(model_size, device="cpu", compute_type=COMPUTE_TYPE)
 
@@ -89,12 +96,13 @@ def main() -> None:
     def commit_and_print() -> None:
         line = state.commit()
         if line:
-            state.set_translation(line.id, fake_translate(line.source, lang))
+            state.set_translation(line.id, translate(line.source, src_lang, tgt_lang))
             committed = state.committed[-1]
             print(f"\r[{committed.id}] {committed.source:<72}")
             print(f"      -> {committed.target}")
 
-    print(f"Listening: lang={lang or 'auto'}, pause={pause_seconds:.1f}s. Ctrl+C to stop.\n")
+    print(f"Listening: lang={lang or 'auto'}, pause={pause_seconds:.2f}s, "
+          f"max={max_phrase_seconds:.1f}s. Ctrl+C to stop.\n")
     try:
         with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS,
                             dtype="float32", callback=callback):
@@ -119,9 +127,11 @@ def main() -> None:
                     last_interim = now
                     print(f"\r  …{state.interim:<72}", end="", flush=True)
 
-                # audio.py says the phrase ended once trailing silence >= the pause.
+                # Adaptive endpointing: a long phrase commits at a shorter gap so
+                # fluent speech doesn't balloon; the hard cap is the last resort.
                 trailing_silence = buf_seconds - segments[-1].end
-                if trailing_silence >= pause_seconds or buf_seconds >= MAX_PHRASE_SECONDS:
+                required_pause = SHORT_PAUSE if buf_seconds >= SOFT_MAX_SECONDS else pause_seconds
+                if trailing_silence >= required_pause or buf_seconds >= max_phrase_seconds:
                     state.update_interim(transcribe(phrase_buf))  # final, clean pass
                     commit_and_print()
                     phrase_buf = np.empty(0, dtype=np.float32)  # start the next phrase
