@@ -90,6 +90,33 @@ def test_prepare_combines_mono_and_resample():
     assert abs(len(out) - 16000) <= 1
 
 
+# --- VAD wrapper options ----------------------------------------------------
+
+
+def test_detect_speech_defaults_to_no_padding(monkeypatch):
+    seen = {}
+
+    def fake_get_speech_timestamps(audio, options, sampling_rate):  # noqa: ANN001
+        seen["speech_pad_ms"] = options.speech_pad_ms
+        return []
+
+    monkeypatch.setattr("src.audio.get_speech_timestamps", fake_get_speech_timestamps)
+    detect_speech(np.zeros(SAMPLE_RATE, dtype=np.float32), SAMPLE_RATE)
+    assert seen["speech_pad_ms"] == 0
+
+
+def test_detect_speech_accepts_custom_padding(monkeypatch):
+    seen = {}
+
+    def fake_get_speech_timestamps(audio, options, sampling_rate):  # noqa: ANN001
+        seen["speech_pad_ms"] = options.speech_pad_ms
+        return []
+
+    monkeypatch.setattr("src.audio.get_speech_timestamps", fake_get_speech_timestamps)
+    detect_speech(np.zeros(SAMPLE_RATE, dtype=np.float32), SAMPLE_RATE, speech_pad_ms=120)
+    assert seen["speech_pad_ms"] == 120
+
+
 # --- phrasing: group_into_phrases (pure boundary logic) ---------------------
 
 

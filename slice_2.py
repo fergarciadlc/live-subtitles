@@ -36,6 +36,8 @@ from faster_whisper import WhisperModel
 
 from src.audio import SAMPLE_RATE, detect_speech, prepare
 from src.captions import CaptionState
+from src.phrase_boundaries import PhraseBoundaryConfig, PhraseBoundaryDetector
+from src.text_units import split_caption_units
 from src.translate import translate
 
 CHANNELS = 1
@@ -89,17 +91,27 @@ def main() -> None:
         return np.concatenate(parts)
 
     state = CaptionState()
+    boundary_detector = PhraseBoundaryDetector(
+        PhraseBoundaryConfig(
+            normal_pause_seconds=pause_seconds,
+            long_phrase_seconds=SOFT_MAX_SECONDS,
+            long_phrase_pause_seconds=SHORT_PAUSE,
+            max_phrase_seconds=max_phrase_seconds,
+        )
+    )
     phrase_buf = np.empty(0, dtype=np.float32)  # audio for the not-yet-committed phrase
     step_samples = int(SAMPLE_RATE * STEP_SECONDS)
     last_interim = 0.0
 
-    def commit_and_print() -> None:
-        line = state.commit()
-        if line:
-            state.set_translation(line.id, translate(line.source, src_lang, tgt_lang))
-            committed = state.committed[-1]
-            print(f"\r[{committed.id}] {committed.source:<72}")
-            print(f"      -> {committed.target}")
+    def commit_and_print(text: str) -> None:
+        for unit in split_caption_units(text):
+            state.update_interim(unit)
+            line = state.commit()
+            if line:
+                state.set_translation(line.id, translate(line.source, src_lang, tgt_lang))
+                committed = state.committed[-1]
+                print(f"\r[{committed.id}] {committed.source:<72}")
+                print(f"      -> {committed.target}")
 
     print(f"Listening: lang={lang or 'auto'}, pause={pause_seconds:.2f}s, "
           f"max={max_phrase_seconds:.1f}s. Ctrl+C to stop.\n")
@@ -127,13 +139,9 @@ def main() -> None:
                     last_interim = now
                     print(f"\r  …{state.interim:<72}", end="", flush=True)
 
-                # Adaptive endpointing: a long phrase commits at a shorter gap so
-                # fluent speech doesn't balloon; the hard cap is the last resort.
-                trailing_silence = buf_seconds - segments[-1].end
-                required_pause = SHORT_PAUSE if buf_seconds >= SOFT_MAX_SECONDS else pause_seconds
-                if trailing_silence >= required_pause or buf_seconds >= max_phrase_seconds:
-                    state.update_interim(transcribe(phrase_buf))  # final, clean pass
-                    commit_and_print()
+                decision = boundary_detector.decide(buf_seconds, segments)
+                if decision.should_commit:
+                    commit_and_print(transcribe(phrase_buf))  # final, clean pass
                     phrase_buf = np.empty(0, dtype=np.float32)  # start the next phrase
                     last_interim = 0.0
     except KeyboardInterrupt:

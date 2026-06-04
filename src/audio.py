@@ -88,6 +88,7 @@ def detect_speech(
     threshold: float = 0.5,
     min_speech_ms: int = 250,
     min_silence_ms: int = 100,
+    speech_pad_ms: int = 0,
 ) -> list[Segment]:
     """Find speech regions via faster-whisper's bundled Silero VAD.
 
@@ -95,11 +96,16 @@ def detect_speech(
     downstream phrasing logic is sample-rate-independent). `min_silence_ms` only
     controls when the VAD itself ends a region — phrase boundaries are decided
     separately by group_into_phrases, which is the testable part.
+
+    `speech_pad_ms` defaults to 0 because these spans are used for boundary
+    timing. Padding is useful when cropping speech audio, but here it hides the
+    short silences that live captions need in order to commit phrases cleanly.
     """
     options = VadOptions(
         threshold=threshold,
         min_speech_duration_ms=min_speech_ms,
         min_silence_duration_ms=min_silence_ms,
+        speech_pad_ms=speech_pad_ms,
     )
     raw = get_speech_timestamps(audio, options, sampling_rate=sample_rate)
     return [Segment(d["start"] / sample_rate, d["end"] / sample_rate) for d in raw]
