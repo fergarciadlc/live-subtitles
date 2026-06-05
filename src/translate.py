@@ -20,6 +20,10 @@ from functools import lru_cache
 from pathlib import Path
 
 import ctranslate2
+
+# Runtime is intentionally torch-free; suppress Transformers' advisory import notice.
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+
 import transformers
 from transformers import MarianTokenizer
 

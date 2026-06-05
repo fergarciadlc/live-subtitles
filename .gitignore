@@ -7,6 +7,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+tmp/
 
 # models / caches
 .cache/

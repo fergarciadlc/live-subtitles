@@ -3,7 +3,7 @@ name = "live-subtitles"
 version = "0.1.0"
 description = "Browser-based live captioning: EN/FR speech -> transcription -> translation. Server-side, swappable ASR."
 requires-python = ">=3.11,<3.13"
-dependencies = ["soxr>=1.1.0,<2", "transformers>=5.9.0,<6", "sentencepiece>=0.2.1,<0.3", "sacremoses>=0.1.1,<0.2"]
+dependencies = ["soxr>=1.1.0,<2", "transformers>=5.9.0,<6", "sentencepiece>=0.2.1,<0.3", "sacremoses>=0.1.1,<0.2", "gradio>=6,<7"]
 
 # --- pixi (local dev environment manager) ---
 # Deploy target is HF Spaces free CPU (linux-64); osx-arm64 is the dev machine.
@@ -26,6 +26,7 @@ numpy = "*"
 faster-whisper = "*"
 # WER metric for compare.py (step 3). Pure-python + rapidfuzz (prebuilt wheels).
 jiwer = "*"
+gradio = ">=6,<7"
 
 [tool.pixi.tasks]
 # Throwaway vertical-slice tasks (build-order step 1) — remove once the real pipeline lands.
@@ -33,6 +34,8 @@ slice-1a = "python slice_1a.py"
 slice-1b = "python slice_1b.py"
 slice-2 = "python slice_2.py"
 compare = "python compare.py"
+eval-fr-exercise = "python eval_live_file.py --audio clips/fr/exercise/cravate-1__=1.mp3 --reference clips/fr/exercise/script.txt --lang fr --pause 0.35 --max 7 --model small"
+app = "python -m src.app"
 
 # Test feature for the deterministic core (step 5): audio.py + captions.py.
 [tool.pixi.feature.test.dependencies]
