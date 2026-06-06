@@ -120,7 +120,35 @@ def _rtc_configuration():
 # --- rendering (pure) -------------------------------------------------------
 
 CSS = """
-.gradio-container { max-width: 1180px !important; }
+.gradio-container {
+    max-width: 1180px !important;
+    --ls-bg: #fbfaf5;
+    --ls-surface: #fffdf8;
+    --ls-border: #e5ded2;
+    --ls-text: #3f352c;
+    --ls-muted: #8a7d6f;
+    --ls-faint: #b4a99e;
+    --ls-accent: #c96d36;
+    --ls-interim-bg: #f6e7d8;
+    --ls-interim-border: #efd8c2;
+    --ls-mic-bg: #fffaf0;
+}
+body.dark .gradio-container,
+html.dark .gradio-container,
+.dark .gradio-container,
+.gradio-container.dark,
+[data-theme="dark"] .gradio-container {
+    --ls-bg: #181513;
+    --ls-surface: #221d19;
+    --ls-border: #4a3d33;
+    --ls-text: #f1e8dc;
+    --ls-muted: #c3b3a3;
+    --ls-faint: #998a7b;
+    --ls-accent: #ffb076;
+    --ls-interim-bg: #33261d;
+    --ls-interim-border: #6e4a33;
+    --ls-mic-bg: #251f1a;
+}
 .app-title h1 { margin-bottom: .1rem; }
 .app-shell { align-items: stretch; }
 .caption-pane { min-width: 0; }
@@ -129,28 +157,30 @@ CSS = """
     display: none !important;
 }
 .control-rail {
-    border: 1px solid #e5ded2;
+    border: 1px solid var(--ls-border);
     border-radius: 8px;
     padding: 14px;
-    background: #fffdf8;
+    background: var(--ls-surface);
 }
 .rail-heading {
     margin: 0 0 10px;
     font-weight: 700;
-    color: #3f352c;
+    color: var(--ls-text);
 }
 .caption-board {
     display: flex;
     flex-direction: column-reverse;
+    gap: 0;
     min-height: 430px;
     max-height: 62vh;
     overflow-y: auto;
     padding: 18px;
-    background: #121416;
-    border: 1px solid #2d3134;
+    background: var(--ls-bg);
+    border: 1px solid var(--ls-border);
     border-radius: 8px;
-    color: #f8fafc;
+    color: var(--ls-text);
     font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
 }
 .caption-board > * { flex: 0 0 auto; }
 .caption-line {
@@ -158,45 +188,64 @@ CSS = """
     grid-template-columns: 42px minmax(0, 1fr);
     gap: 12px;
     padding: 12px 0;
-    border-bottom: 1px solid #2d3134;
+    border-bottom: 1px solid var(--ls-border);
 }
 .caption-line:last-child { border-bottom: 0; }
 .caption-line.interim {
     grid-template-columns: 1fr;
-    opacity: .74;
+    margin-bottom: 8px;
+    border: 1px solid var(--ls-interim-border);
+    border-radius: 8px;
+    background: var(--ls-interim-bg);
+    padding: 12px 14px;
 }
 .line-id {
-    color: #a5a09a;
+    color: var(--ls-faint);
     font-variant-numeric: tabular-nums;
     font-size: .86rem;
     padding-top: 3px;
 }
 .caption-copy { min-width: 0; }
 .cap .src {
-    color: #fffaf0;
-    font-size: 1.12rem;
-    font-weight: 650;
+    color: var(--ls-text);
+    font-size: 1rem;
+    font-weight: 400;
     line-height: 1.45;
     overflow-wrap: anywhere;
 }
 .cap .tgt {
-    color: #f0b56f;
-    font-size: 1rem;
+    color: var(--ls-accent);
+    font-size: 1.12rem;
+    font-weight: 750;
     line-height: 1.45;
     margin-top: 4px;
     overflow-wrap: anywhere;
 }
-.cap.interim .src { font-style: italic; }
-.cap.interim .cursor { font-style: normal; animation: blink 1s steps(1) infinite; }
+.cap.interim .src {
+    color: var(--ls-muted);
+    font-style: italic;
+}
+.cap.interim .cursor {
+    font-style: normal;
+    color: var(--ls-accent);
+    animation: blink 1s steps(1) infinite;
+}
 @keyframes blink { 50% { opacity: 0; } }
-.pending { color: #a5a09a; font-style: italic; }
+.pending {
+    color: var(--ls-faint);
+    font-style: italic;
+    font-weight: 400;
+}
 .empty {
     min-height: 370px;
     width: 100%;
     display: flex;
     align-items: center;
     justify-content: center;
-    color: #a5a09a;
+    color: var(--ls-faint);
+}
+@media (max-width: 820px) {
+    .caption-board { min-height: 340px; max-height: 54vh; }
 }
 .mic-compact {
     min-height: auto !important;
@@ -207,10 +256,10 @@ CSS = """
     justify-content: center !important;
     gap: 8px !important;
     min-height: 70px !important;
-    border: 1px solid #e5ded2 !important;
+    border: 1px solid var(--ls-border) !important;
     border-radius: 8px !important;
-    background: #fffaf0 !important;
-    color: #4a4037 !important;
+    background: var(--ls-mic-bg) !important;
+    color: var(--ls-text) !important;
 }
 .mic-compact [title="grant webcam access"]::after {
     content: "Enable microphone";
@@ -249,15 +298,15 @@ CSS = """
     gap: 10px;
     margin-top: 12px;
     padding: 12px 14px;
-    border: 1px solid #e5ded2;
+    border: 1px solid var(--ls-border);
     border-radius: 8px;
-    background: #fffdf8;
-    color: #4a4037;
+    background: var(--ls-surface);
+    color: var(--ls-text);
 }
 .status-item { min-width: 0; }
 .status-label {
     display: block;
-    color: #8a7d6f;
+    color: var(--ls-muted);
     font-size: .72rem;
     font-weight: 700;
     letter-spacing: .06em;
@@ -271,11 +320,10 @@ CSS = """
 }
 .status-detail {
     grid-column: 1 / -1;
-    color: #8a7d6f;
+    color: var(--ls-muted);
     font-size: .9rem;
 }
 @media (max-width: 820px) {
-    .caption-board { min-height: 340px; max-height: 54vh; }
     .status-card { grid-template-columns: 1fr; }
 }
 
@@ -296,13 +344,21 @@ CSS = """
 """
 
 
-def render_captions(interim: str, committed: tuple[Line, ...], *, max_lines: int = 50) -> str:
-    """Build the caption board HTML: committed lines plus the in-progress interim line."""
+def render_captions(
+    interim: str,
+    committed: tuple[Line, ...],
+    *,
+    max_lines: int = 50,
+    direction: str = DEFAULTS["direction"],
+    state: str = "ready",
+) -> str:
+    """Build the caption scrollback: committed lines plus the in-progress interim line."""
+    del direction, state
     rows: list[str] = []
     if interim:
         rows.append(
             "<div class='cap interim caption-line'>"
-            f"<div class='src'>{escape(interim)} <span class='cursor'>▌</span></div>"
+            f"<div class='src'>{escape(interim)} <span class='cursor'>|</span></div>"
             "<div class='tgt pending'>transcribing...</div>"
             "</div>"
         )
@@ -490,7 +546,7 @@ class CaptioningHandler(StreamHandler):
                 logger.exception("pipeline error; dropping this chunk")
                 self._out.put(
                     (
-                        render_captions("", ()),
+                        render_captions("", (), state="error"),
                         render_status("error", detail="Pipeline error; this chunk was dropped."),
                     )
                 )
@@ -498,7 +554,7 @@ class CaptioningHandler(StreamHandler):
             if update is not None:
                 self._out.put(
                     (
-                        render_captions(update.interim, update.committed),
+                        render_captions(update.interim, update.committed, direction=direction, state="listening"),
                         render_status(
                             "listening",
                             direction=direction,
@@ -529,7 +585,7 @@ def _reset_view(
     _apply_controls(direction, model, pause, max_phrase, new_token)
     return (
         new_token,
-        render_captions("", ()),
+        render_captions("", (), direction=direction, state="ready"),
         render_status("reset", direction=direction, model_size=model, committed=0, detail="Caption history cleared."),
     )
 
@@ -544,7 +600,7 @@ def replay_file(
     """Run an uploaded file through the same LiveSession core as the live stream."""
     if audio is None:
         return (
-            render_captions("", ()),
+            render_captions("", (), direction=direction, state="file"),
             render_status("file", direction=direction, model_size=model_size, detail="No audio file selected."),
         )
 
@@ -563,7 +619,7 @@ def replay_file(
     prepared = prepare(samples, sample_rate)
     if prepared.size == 0:
         return (
-            render_captions("", ()),
+            render_captions("", (), direction=direction, state="file"),
             render_status("file", direction=direction, model_size=model_size, detail="Selected file had no audio samples."),
         )
 
@@ -579,14 +635,14 @@ def replay_file(
     except Exception:
         logger.exception("file replay failed")
         return (
-            render_captions(session.captions.interim, session.captions.committed),
+            render_captions(session.captions.interim, session.captions.committed, direction=direction, state="file"),
             render_status("file error", direction=direction, model_size=model_size, detail="File replay failed."),
         )
 
     duration = len(prepared) / SAMPLE_RATE
     committed = session.captions.committed
     return (
-        render_captions(session.captions.interim, committed),
+        render_captions(session.captions.interim, committed, direction=direction, state="file"),
         render_status(
             "file complete",
             direction=direction,

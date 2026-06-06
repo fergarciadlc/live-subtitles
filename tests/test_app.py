@@ -13,6 +13,7 @@ import gradio as gr
 
 from src.app import (
     CaptioningHandler,
+    CSS,
     MIC_BUTTON_LABELS,
     _frames_to_audio,
     _push_outputs,
@@ -26,12 +27,19 @@ from src.captions import Line
 
 
 def test_render_empty_prompts_to_speak():
-    assert "Listening" in render_captions("", ())
+    html = render_captions("", ())
+    assert "caption-board" in html and "Listening" in html
 
 
 def test_render_shows_source_and_translation():
     html = render_captions("", (Line(id=0, source="Hello there", target="Bonjour"),))
-    assert "Hello there" in html and "Bonjour" in html
+    assert "Hello there" in html and "Bonjour" in html and "caption-board" in html
+
+
+def test_caption_css_weights_translation_over_source():
+    assert ".cap .src" in CSS and "font-weight: 400" in CSS
+    assert ".cap .tgt" in CSS and "font-weight: 750" in CSS
+    assert "body.dark .gradio-container" in CSS and "--ls-bg: #181513" in CSS
 
 
 def test_render_orders_newest_first_for_pinned_scroll():
