@@ -39,6 +39,8 @@ def test_missing_model_raises_with_guidance():
 
 _FR_EN = Path("models/opus-mt-fr-en")
 _EN_FR = Path("models/opus-mt-en-fr")
+_EN_ES = Path("models/opus-mt-en-es")
+_FR_ES = Path("models/opus-mt-fr-es")
 
 
 @pytest.mark.skipif(not (_FR_EN / "model.bin").exists(), reason="fr-en model not built")
@@ -53,3 +55,17 @@ def test_translates_en_to_fr():
     out = translate("Hello, I am Canadian.", "en", "fr")
     assert isinstance(out, str) and out.strip()
     assert out != "Hello, I am Canadian."
+
+
+@pytest.mark.skipif(not (_EN_ES / "model.bin").exists(), reason="en-es model not built")
+def test_translates_en_to_es():
+    out = translate("Hello, I am Canadian.", "en", "es")
+    assert isinstance(out, str) and out.strip()
+    assert out != "Hello, I am Canadian."
+
+
+@pytest.mark.skipif(not (_FR_ES / "model.bin").exists(), reason="fr-es model not built")
+def test_translates_fr_to_es():
+    out = translate("Bonjour, je suis canadien.", "fr", "es")
+    assert isinstance(out, str) and out.strip()
+    assert out != "Bonjour, je suis canadien."

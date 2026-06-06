@@ -14,7 +14,9 @@ import gradio as gr
 from src.app import (
     CaptioningHandler,
     CSS,
+    DIRECTIONS,
     MIC_BUTTON_LABELS,
+    _available_directions,
     _frames_to_audio,
     _push_outputs,
     _reset_view,
@@ -24,6 +26,12 @@ from src.app import (
     replay_file,
 )
 from src.captions import Line
+
+
+def _touch_mt_model(root, src: str, tgt: str) -> None:
+    model_dir = root / f"opus-mt-{src}-{tgt}"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.bin").touch()
 
 
 def test_render_empty_prompts_to_speak():
@@ -40,6 +48,33 @@ def test_caption_css_weights_translation_over_source():
     assert ".cap .src" in CSS and "font-weight: 400" in CSS
     assert ".cap .tgt" in CSS and "font-weight: 750" in CSS
     assert "body.dark .gradio-container" in CSS and "--ls-bg: #181513" in CSS
+
+
+def test_directions_include_spanish_target_only():
+    assert DIRECTIONS["en→es"] == ("en", "es")
+    assert DIRECTIONS["fr→es"] == ("fr", "es")
+    assert not any(src == "es" for src, _ in DIRECTIONS.values())
+
+
+def test_available_directions_hide_missing_spanish_models(monkeypatch, tmp_path):
+    monkeypatch.setenv("LIVE_SUBTITLES_MODELS_DIR", str(tmp_path))
+    _touch_mt_model(tmp_path, "fr", "en")
+    _touch_mt_model(tmp_path, "en", "fr")
+
+    choices = _available_directions()
+
+    assert "fr→en" in choices and "en→fr" in choices
+    assert "fr→es" not in choices and "en→es" not in choices
+
+
+def test_available_directions_show_spanish_models_when_present(monkeypatch, tmp_path):
+    monkeypatch.setenv("LIVE_SUBTITLES_MODELS_DIR", str(tmp_path))
+    for src, tgt in DIRECTIONS.values():
+        _touch_mt_model(tmp_path, src, tgt)
+
+    choices = _available_directions()
+
+    assert "fr→es" in choices and "en→es" in choices
 
 
 def test_render_orders_newest_first_for_pinned_scroll():
@@ -112,6 +147,17 @@ def test_controls_validate_unexpected_values():
     handler = CaptioningHandler()
     handler.latest_args = ["x", "y", "??", "nope", "p", "q"]  # garbage in the tail
     assert handler._controls() == ("fr→en", "small", 0.5, 7.0, 0)
+
+
+def test_controls_fall_back_when_direction_model_missing(monkeypatch, tmp_path):
+    monkeypatch.setenv("LIVE_SUBTITLES_MODELS_DIR", str(tmp_path))
+    _touch_mt_model(tmp_path, "fr", "en")
+    _touch_mt_model(tmp_path, "en", "fr")
+
+    handler = CaptioningHandler()
+    handler.latest_args = ["__webrtc_value__", "webrtc-id", "fr→es", "tiny", 0.3, 5.0, 2]
+
+    assert handler._controls() == ("fr→en", "tiny", 0.3, 5.0, 2)
 
 
 def test_push_outputs_routes_caption_and_status():

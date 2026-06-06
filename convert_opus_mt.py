@@ -21,6 +21,8 @@ MODELS_DIR = Path("models")
 DIRECTIONS = [
     ("en", "fr"),
     ("fr", "en"),
+    ("en", "es"),
+    ("fr", "es"),
 ]
 
 

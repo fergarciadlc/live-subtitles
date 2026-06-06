@@ -50,7 +50,12 @@ from src.session import LiveSession
 logger = logging.getLogger(__name__)
 
 MODEL_SIZES = ["tiny", "base", "small"]
-DIRECTIONS = {"fr→en": ("fr", "en"), "en→fr": ("en", "fr")}
+DIRECTIONS = {
+    "fr→en": ("fr", "en"),
+    "en→fr": ("en", "fr"),
+    "en→es": ("en", "es"),
+    "fr→es": ("fr", "es"),
+}
 DEFAULTS = {"direction": "fr→en", "model": "small", "pause": 0.5, "max": 7.0, "reset": 0}
 MIC_BUTTON_LABELS = {
     "start": "Start listening",
@@ -66,6 +71,7 @@ _LIVE_CONTROLS: dict = dict(DEFAULTS)
 
 def _apply_controls(direction: str, model: str, pause: float, max_phrase: float, reset_token: int = 0) -> None:
     """UI change-event sink: remember the latest control values (fallback path)."""
+    direction = _normalise_direction(direction)
     _LIVE_CONTROLS.update(direction=direction, model=model, pause=pause, max=max_phrase, reset=reset_token)
 
 
@@ -84,7 +90,7 @@ def get_asr(model_size: str) -> FasterWhisperASR:
     return asr
 
 
-def ensure_mt_models(directions=(("en", "fr"), ("fr", "en"))) -> None:
+def ensure_mt_models(directions: tuple[tuple[str, str], ...] | None = None) -> None:
     """Pull the Opus-MT models from the Hub when running on a fresh deploy.
 
     Local dev already has them (built once via `pixi run -e convert convert-mt`), so
@@ -92,17 +98,48 @@ def ensure_mt_models(directions=(("en", "fr"), ("fr", "en"))) -> None:
     converted CTranslate2 dirs — the chosen deploy strategy: ship nothing in the repo,
     download on first boot like faster-whisper already does for the ASR weights.
     """
+    if directions is None:
+        directions = tuple(dict.fromkeys(DIRECTIONS.values()))
     repo = os.environ.get("LIVE_SUBTITLES_MT_REPO")
     if not repo:
         return
     from huggingface_hub import snapshot_download
 
-    root = Path(os.environ.get("LIVE_SUBTITLES_MODELS_DIR", "models"))
+    root = _mt_models_root()
     for src, tgt in directions:
         name = f"opus-mt-{src}-{tgt}"
         if not (root / name / "model.bin").exists():
             logger.info("downloading %s from %s", name, repo)
             snapshot_download(repo_id=repo, allow_patterns=f"{name}/*", local_dir=str(root))
+
+
+def _mt_models_root() -> Path:
+    return Path(os.environ.get("LIVE_SUBTITLES_MODELS_DIR", "models"))
+
+
+def _mt_model_ready(source_lang: str, target_lang: str) -> bool:
+    return (_mt_models_root() / f"opus-mt-{source_lang}-{target_lang}" / "model.bin").exists()
+
+
+def _available_directions() -> dict[str, tuple[str, str]]:
+    """Configured directions whose converted MT model is present.
+
+    Keep the default visible even in a half-configured checkout so the UI has a sane
+    fallback and any missing-model error can be reported in the status panel.
+    """
+    available = {label: pair for label, pair in DIRECTIONS.items() if _mt_model_ready(*pair)}
+    if DEFAULTS["direction"] not in available:
+        available[DEFAULTS["direction"]] = DIRECTIONS[DEFAULTS["direction"]]
+    return available
+
+
+def _normalise_direction(direction: str | None) -> str:
+    available = _available_directions()
+    if direction in available:
+        return direction
+    if DEFAULTS["direction"] in available:
+        return DEFAULTS["direction"]
+    return next(iter(available))
 
 
 def _rtc_configuration():
@@ -486,7 +523,7 @@ class CaptioningHandler(StreamHandler):
             raw_direction, raw_model, raw_pause, raw_max, raw_reset = values[-5:]
             c = {"direction": raw_direction, "model": raw_model, "pause": raw_pause, "max": raw_max}
             reset_token = _reset_value(raw_reset)
-        elif isinstance(values, list) and len(values) >= 4:
+        elif isinstance(values, list) and len(values) >= 4 and values[-4] in DIRECTIONS:
             raw_direction, raw_model, raw_pause, raw_max = values[-4:]
             c = {"direction": raw_direction, "model": raw_model, "pause": raw_pause, "max": raw_max}
             reset_token = _reset_value(_LIVE_CONTROLS.get("reset"))
@@ -495,7 +532,7 @@ class CaptioningHandler(StreamHandler):
             c = _LIVE_CONTROLS
             reset_token = _reset_value(c.get("reset"))
         d = DEFAULTS
-        direction = c.get("direction") if c.get("direction") in DIRECTIONS else d["direction"]
+        direction = _normalise_direction(c.get("direction"))
         model = c.get("model") if c.get("model") in MODEL_SIZES else d["model"]
         try:
             pause, max_phrase = float(c.get("pause")), float(c.get("max"))
@@ -539,9 +576,22 @@ class CaptioningHandler(StreamHandler):
                     frames.append(self._in.get_nowait()[1])
                 except queue.Empty:
                     break
+            direction = DEFAULTS["direction"]
+            model_size = DEFAULTS["model"]
             try:
                 direction, model_size, *_ = self._sync_session()
                 update = self._session.feed(_frames_to_audio(frames), sample_rate)
+            except FileNotFoundError as exc:
+                logger.warning("required translation model unavailable; resetting session: %s", exc)
+                self._session = None
+                self._applied = None
+                self._out.put(
+                    (
+                        render_captions("", (), direction=direction, state="error"),
+                        render_status("missing model", direction=direction, model_size=model_size, detail=str(exc)),
+                    )
+                )
+                continue
             except Exception:
                 logger.exception("pipeline error; dropping this chunk")
                 self._out.put(
@@ -581,6 +631,7 @@ def _reset_view(
     pause: float,
     max_phrase: float,
 ) -> tuple[int, str, str]:
+    direction = _normalise_direction(direction)
     new_token = _reset_value(reset_token) + 1
     _apply_controls(direction, model, pause, max_phrase, new_token)
     return (
@@ -604,8 +655,7 @@ def replay_file(
             render_status("file", direction=direction, model_size=model_size, detail="No audio file selected."),
         )
 
-    if direction not in DIRECTIONS:
-        direction = DEFAULTS["direction"]
+    direction = _normalise_direction(direction)
     if model_size not in MODEL_SIZES:
         model_size = DEFAULTS["model"]
     try:
@@ -632,6 +682,12 @@ def replay_file(
             session.feed(prepared[start : start + step_samples], SAMPLE_RATE)
         flush_seconds = max(1.0, pause + 0.5)
         session.feed(np.zeros(int(SAMPLE_RATE * flush_seconds), dtype=np.float32), SAMPLE_RATE)
+    except FileNotFoundError as exc:
+        logger.warning("file replay translation model unavailable: %s", exc)
+        return (
+            render_captions(session.captions.interim, session.captions.committed, direction=direction, state="file"),
+            render_status("missing model", direction=direction, model_size=model_size, detail=str(exc)),
+        )
     except Exception:
         logger.exception("file replay failed")
         return (
@@ -654,6 +710,8 @@ def replay_file(
 
 
 def build_ui() -> gr.Blocks:
+    available_directions = _available_directions()
+    default_direction = _normalise_direction(DEFAULTS["direction"])
     with gr.Blocks(css=CSS, title="Live Subtitles") as demo:
         reset_token = gr.State(value=DEFAULTS["reset"])
         gr.Markdown("# Live Subtitles", elem_classes=["app-title"])
@@ -685,7 +743,7 @@ def build_ui() -> gr.Blocks:
                     button_labels=MIC_BUTTON_LABELS,
                     full_screen=False,
                 )
-                direction = gr.Dropdown(list(DIRECTIONS), value=DEFAULTS["direction"], label="Direction")
+                direction = gr.Dropdown(list(available_directions), value=default_direction, label="Direction")
                 model = gr.Dropdown(MODEL_SIZES, value=DEFAULTS["model"], label="ASR model")
                 with gr.Accordion("Timing", open=True):
                     pause = gr.Slider(0.2, 1.5, value=DEFAULTS["pause"], step=0.05, label="Pause to commit (s)")
