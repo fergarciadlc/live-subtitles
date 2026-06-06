@@ -16,16 +16,31 @@ platforms = ["osx-arm64", "linux-64"]
 python = "3.12.*"
 # PyAV from conda-forge (prebuilt) so it isn't compiled against the system ffmpeg,
 # which fails on Homebrew ffmpeg 7. pixi maps it to satisfy the PyPI solve.
-av = "*"
+# Capped to aiortc 1.14's window (av>=14,<17): unpinned, the conda solve grabs av 17
+# and aiortc backtracks to a prehistoric 0.5.0 that breaks fastrtc's imports.
+av = ">=14,<17"
 # Mic capture (slice 1b). conda-forge ships PortAudio prebuilt with the bindings.
 python-sounddevice = "*"
-numpy = "*"
+# numpy/pillow are capped so the Gradio+FastRTC stack solves: fastrtc->numba needs
+# numpy<2.2, and the gradio 5.x versions that accept numpy 2.x need pillow<12.
+# Without these caps the conda solve pins numpy 2.4 / pillow 12 and fastrtc collapses
+# to an empty 0.0.1 placeholder. Everything else here is happy on numpy 2.1.
+numpy = "<2.2"
+pillow = "<12"
 
 [tool.pixi.pypi-dependencies]
 # faster-whisper + ctranslate2 ship prebuilt PyPI wheels (no compile); av is satisfied above.
 faster-whisper = "*"
 # WER metric for compare.py (step 3). Pure-python + rapidfuzz (prebuilt wheels).
 jiwer = "*"
+# Real-time WebRTC transport for the Gradio app (step 7). Pulls gradio + aiortc;
+# CPU-only, no torch — stays inside the deploy budget. Used purely as transport
+# (we run our own VAD + endpointer), see src/session.py.
+fastrtc = ">=0.0.34"
+# fastrtc leaves aiortc unpinned; without this floor the solver settles on a
+# prehistoric 0.5.0 (no MediaStreamTrack) that breaks fastrtc's imports. 1.14 is
+# what pairs with av<17 above.
+aiortc = ">=1.14"
 
 [tool.pixi.tasks]
 # Throwaway vertical-slice tasks (build-order step 1) — remove once the real pipeline lands.
@@ -33,6 +48,8 @@ slice-1a = "python slice_1a.py"
 slice-1b = "python slice_1b.py"
 slice-2 = "python slice_2.py"
 compare = "python compare.py"
+# The Gradio + FastRTC app (step 7).
+app = "python -m src.app"
 
 # Test feature for the deterministic core (step 5): audio.py + captions.py.
 [tool.pixi.feature.test.dependencies]
