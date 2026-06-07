@@ -1,9 +1,4 @@
-"""Smoke + unit tests for the app shell (src/app.py).
-
-These cover the pieces that don't need a browser or models: the pure caption renderer,
-int16→float frame normalisation, control parsing, and that the Blocks UI actually wires
-up (a build-time check that the FastRTC/Gradio plumbing is consistent).
-"""
+"""Smoke and unit tests for the Gradio app shell."""
 
 from __future__ import annotations
 
@@ -12,13 +7,14 @@ import numpy as np
 import gradio as gr
 
 from src.app import (
-    CaptioningHandler,
     CSS,
     DIRECTIONS,
-    MIC_BUTTON_LABELS,
+    _drop_stream_state,
+    _flush_stream,
+    _normalise_audio_array,
+    _normalise_stream_controls,
+    _stream_audio,
     _available_directions,
-    _frames_to_audio,
-    _push_outputs,
     _reset_view,
     build_ui,
     render_captions,
@@ -110,43 +106,16 @@ def test_render_status_escapes_html():
     assert "<ready>" not in html
 
 
-def test_frames_to_audio_normalises_int16():
-    frame = np.array([[16384, -16384]], dtype=np.int16)  # shape (1, n), as WebRTC delivers
-    out = _frames_to_audio([frame])
+def test_normalise_audio_array_normalises_int16():
+    frame = np.array([[16384, -16384]], dtype=np.int16)
+    out = _normalise_audio_array(frame)
     assert out.dtype == np.float32
-    assert out.shape == (2,)
-    assert np.allclose(out, [0.5, -0.5], atol=1e-3)
-
-
-def test_controls_prefer_latest_args_tail():
-    handler = CaptioningHandler()
-    # FastRTC prefixes latest_args with transport metadata; the controls are the last 5.
-    handler.latest_args = ["__webrtc_value__", "webrtc-id", "en→fr", "tiny", 0.3, 5.0, 2]
-    assert handler._controls() == ("en→fr", "tiny", 0.3, 5.0, 2)
-
-
-def test_controls_support_old_four_value_tail():
-    handler = CaptioningHandler()
-    handler.latest_args = ["__webrtc_value__", "webrtc-id", "en→fr", "tiny", 0.3, 5.0]
-    assert handler._controls() == ("en→fr", "tiny", 0.3, 5.0, 0)
-
-
-def test_controls_fall_back_to_store_without_stream_args():
-    from src import app
-
-    handler = CaptioningHandler()  # fresh: no per-stream latest_args yet
-    app._LIVE_CONTROLS.update(app.DEFAULTS)
-    try:
-        app._apply_controls("en→fr", "base", 0.4, 6.0)  # what a UI change event does
-        assert handler._controls() == ("en→fr", "base", 0.4, 6.0, 0)
-    finally:
-        app._LIVE_CONTROLS.update(app.DEFAULTS)
+    assert out.shape == frame.shape
+    assert np.allclose(out, [[0.5, -0.5]], atol=1e-3)
 
 
 def test_controls_validate_unexpected_values():
-    handler = CaptioningHandler()
-    handler.latest_args = ["x", "y", "??", "nope", "p", "q"]  # garbage in the tail
-    assert handler._controls() == ("fr→en", "small", 0.5, 7.0, 0)
+    assert _normalise_stream_controls("??", "nope", "p", "q") == ("fr→en", "small", 0.5, 7.0, 0)
 
 
 def test_controls_fall_back_when_direction_model_missing(monkeypatch, tmp_path):
@@ -154,19 +123,35 @@ def test_controls_fall_back_when_direction_model_missing(monkeypatch, tmp_path):
     _touch_mt_model(tmp_path, "fr", "en")
     _touch_mt_model(tmp_path, "en", "fr")
 
-    handler = CaptioningHandler()
-    handler.latest_args = ["__webrtc_value__", "webrtc-id", "fr→es", "tiny", 0.3, 5.0, 2]
-
-    assert handler._controls() == ("fr→en", "tiny", 0.3, 5.0, 2)
+    assert _normalise_stream_controls("fr→es", "tiny", 0.3, 5.0, 2) == ("fr→en", "tiny", 0.3, 5.0, 2)
 
 
-def test_push_outputs_routes_caption_and_status():
-    assert _push_outputs("<caption>", "<status>") == ("<caption>", "<status>")
+def test_stream_audio_without_audio_returns_status():
+    stream_id = "test-stream-empty"
+    try:
+        captions, status, returned_id = _stream_audio(None, stream_id, "fr→en", "tiny", 0.5, 7.0, 0)
+    finally:
+        _drop_stream_state(stream_id)
+    assert returned_id == stream_id
+    assert "Listening" in captions
+    assert "Waiting for microphone audio" in status
+
+
+def test_flush_stream_without_session_returns_status():
+    stream_id = "test-stream-flush-empty"
+    try:
+        captions, status, returned_id = _flush_stream(stream_id, "fr→en", "tiny", 0.5, 7.0, 0)
+    finally:
+        _drop_stream_state(stream_id)
+    assert returned_id == stream_id
+    assert "Listening" in captions
+    assert "Microphone stopped" in status
 
 
 def test_reset_view_increments_token_and_clears_display():
-    token, captions, status = _reset_view(3, "en→fr", "base", 0.4, 6.0)
+    token, captions, status, stream_id = _reset_view(3, "en→fr", "base", 0.4, 6.0, "old-stream")
     assert token == 4
+    assert stream_id != "old-stream"
     assert "Listening" in captions
     assert "reset" in status and "base" in status
 
@@ -180,8 +165,3 @@ def test_replay_file_without_audio_returns_status():
 def test_build_ui_constructs():
     demo = build_ui()
     assert isinstance(demo, gr.Blocks)
-
-
-def test_mic_button_labels_are_explicit():
-    assert MIC_BUTTON_LABELS["start"] == "Start listening"
-    assert MIC_BUTTON_LABELS["stop"] == "Stop listening"

@@ -1,48 +1,22 @@
-"""Gradio + FastRTC app — build-order step 7. UI and wiring only.
-
-No transcription logic lives here (that is src/session.py's LiveSession). This module
-is the transport + UI shell:
-
-  browser mic --WebRTC--> CaptioningHandler.receive() --queue--> worker thread
-       worker thread: LiveSession.feed() --> render_captions() --queue-->
-  CaptioningHandler.emit() returns AdditionalOutputs --> caption + status displays
-
-We use FastRTC's low-level StreamHandler (not ReplyOnPause): ReplyOnPause runs its own
-VAD and only yields audio after a pause, which would kill the live interim caption and
-make our adaptive endpointer + the pause/max sliders meaningless. So FastRTC is pure
-transport; LiveSession owns VAD, endpointing, ASR and translation.
-
-The heavy per-chunk work runs on a worker thread so the WebRTC receive path is never
-blocked — the streaming-era version of slice_2's "drain the queue to stay at the live
-edge". ASR weights are shared across sessions (get_asr, lru-cached by size); each
-connection gets its own LiveSession via StreamHandler.copy().
-
-Two FastRTC gotchas this file handles explicitly (both were "the app looks broken" bugs):
-  - The WebRTC widget defaults to a fullscreen-capable mode that can overlay the page and
-    hide the controls/record button — we pass full_screen=False (+ a CSS backstop).
-  - Control values arrive in latest_args with transport metadata PREFIXED, so the real
-    controls are the TAIL (latest_args[-5:]), not [1:].
-
-Run locally:  pixi run app      (opens http://127.0.0.1:7860)
-"""
+"""Gradio UI and streaming transport for live subtitles."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 import os
-import queue
 import threading
+from uuid import uuid4
 from functools import lru_cache
 from html import escape
 from pathlib import Path
 
 import numpy as np
-from fastrtc import AdditionalOutputs, StreamHandler, WebRTC
 
 import gradio as gr
 
 from src.asr.faster_whisper import FasterWhisperASR
-from src.audio import SAMPLE_RATE, prepare, to_mono
+from src.audio import SAMPLE_RATE, prepare
 from src.captions import Line
 from src.phrase_boundaries import PhraseBoundaryConfig
 from src.session import LiveSession
@@ -57,22 +31,10 @@ DIRECTIONS = {
     "fr→es": ("fr", "es"),
 }
 DEFAULTS = {"direction": "fr→en", "model": "small", "pause": 0.5, "max": 7.0, "reset": 0}
-MIC_BUTTON_LABELS = {
-    "start": "Start listening",
-    "stop": "Stop listening",
-    "waiting": "Connecting...",
-}
-
-# Fallback control store, written by the UI change events. The authoritative per-connection
-# values come through the stream inputs (latest_args); this store covers non-stream contexts
-# (and tests). Process-global — fine for the single-presenter use this demo targets.
-_LIVE_CONTROLS: dict = dict(DEFAULTS)
-
-
-def _apply_controls(direction: str, model: str, pause: float, max_phrase: float, reset_token: int = 0) -> None:
-    """UI change-event sink: remember the latest control values (fallback path)."""
-    direction = _normalise_direction(direction)
-    _LIVE_CONTROLS.update(direction=direction, model=model, pause=pause, max=max_phrase, reset=reset_token)
+REQUIRED_DIRECTION_LABELS = ("fr→en", "en→fr")
+LIVE_STREAM_EVERY_SECONDS = 0.75
+LIVE_INTERIM_EVERY_SECONDS = 1.5
+LIVE_INTERIM_MODEL = "tiny"
 
 
 # --- shared model loading ---------------------------------------------------
@@ -80,26 +42,22 @@ def _apply_controls(direction: str, model: str, pause: float, max_phrase: float,
 
 @lru_cache(maxsize=None)
 def get_asr(model_size: str) -> FasterWhisperASR:
-    """Load (and cache) one ASR adapter per model size, shared across all sessions.
-
-    CTranslate2 models are safe to run concurrently, so sessions share the weights
-    read-only — only the per-session LiveSession state differs.
-    """
+    """Load and cache one ASR adapter per model size."""
     asr = FasterWhisperASR(model_size)
     asr.load()
     return asr
 
 
-def ensure_mt_models(directions: tuple[tuple[str, str], ...] | None = None) -> None:
-    """Pull the Opus-MT models from the Hub when running on a fresh deploy.
-
-    Local dev already has them (built once via `pixi run -e convert convert-mt`), so
-    this is a no-op unless LIVE_SUBTITLES_MT_REPO points at a Hub repo holding the
-    converted CTranslate2 dirs — the chosen deploy strategy: ship nothing in the repo,
-    download on first boot like faster-whisper already does for the ASR weights.
-    """
+def ensure_mt_models(
+    directions: tuple[tuple[str, str], ...] | None = None,
+    required: tuple[tuple[str, str], ...] | None = None,
+) -> None:
+    """Download missing converted MT models when LIVE_SUBTITLES_MT_REPO is set."""
     if directions is None:
         directions = tuple(dict.fromkeys(DIRECTIONS.values()))
+    if required is None:
+        required = tuple(DIRECTIONS[label] for label in REQUIRED_DIRECTION_LABELS)
+    required_set = set(required)
     repo = os.environ.get("LIVE_SUBTITLES_MT_REPO")
     if not repo:
         return
@@ -110,7 +68,18 @@ def ensure_mt_models(directions: tuple[tuple[str, str], ...] | None = None) -> N
         name = f"opus-mt-{src}-{tgt}"
         if not (root / name / "model.bin").exists():
             logger.info("downloading %s from %s", name, repo)
-            snapshot_download(repo_id=repo, allow_patterns=f"{name}/*", local_dir=str(root))
+            try:
+                snapshot_download(repo_id=repo, allow_patterns=f"{name}/*", local_dir=str(root))
+            except Exception:
+                if (src, tgt) in required_set:
+                    raise
+                logger.warning("optional MT model %s unavailable in %s; skipping", name, repo)
+                continue
+        if not (root / name / "model.bin").exists():
+            message = f"No converted Opus-MT model at {root / name}"
+            if (src, tgt) in required_set:
+                raise FileNotFoundError(message)
+            logger.warning("%s; optional direction will stay hidden", message)
 
 
 def _mt_models_root() -> Path:
@@ -122,11 +91,7 @@ def _mt_model_ready(source_lang: str, target_lang: str) -> bool:
 
 
 def _available_directions() -> dict[str, tuple[str, str]]:
-    """Configured directions whose converted MT model is present.
-
-    Keep the default visible even in a half-configured checkout so the UI has a sane
-    fallback and any missing-model error can be reported in the status panel.
-    """
+    """Return directions whose converted MT model is present."""
     available = {label: pair for label, pair in DIRECTIONS.items() if _mt_model_ready(*pair)}
     if DEFAULTS["direction"] not in available:
         available[DEFAULTS["direction"]] = DIRECTIONS[DEFAULTS["direction"]]
@@ -140,18 +105,6 @@ def _normalise_direction(direction: str | None) -> str:
     if DEFAULTS["direction"] in available:
         return DEFAULTS["direction"]
     return next(iter(available))
-
-
-def _rtc_configuration():
-    """No TURN locally; use the Space's HF community TURN server when deployed."""
-    if os.environ.get("SYSTEM") == "spaces":
-        try:
-            from fastrtc import get_hf_turn_credentials
-
-            return get_hf_turn_credentials()
-        except Exception:  # pragma: no cover - deploy-only path
-            logger.warning("HF TURN credentials unavailable; falling back to none")
-    return None
 
 
 # --- rendering (pure) -------------------------------------------------------
@@ -287,47 +240,16 @@ html.dark .gradio-container,
 .mic-compact {
     min-height: auto !important;
 }
-.mic-compact [title="grant webcam access"] {
-    display: flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    gap: 8px !important;
-    min-height: 70px !important;
-    border: 1px solid var(--ls-border) !important;
+.mic-compact > div,
+.mic-compact .wrap {
+    min-height: 88px !important;
+    border-color: var(--ls-border) !important;
     border-radius: 8px !important;
     background: var(--ls-mic-bg) !important;
     color: var(--ls-text) !important;
 }
-.mic-compact [title="grant webcam access"]::after {
-    content: "Enable microphone";
-    pointer-events: none;
-    font-weight: 650;
-}
-.mic-compact .gradio-webrtc-waveContainer,
-.mic-compact .wave-container,
-.mic-compact .wave-svg,
-.mic-compact .standard-player {
-    display: none !important;
-}
-.mic-compact .audio-container {
-    min-height: 70px !important;
-    height: 70px !important;
-    justify-content: center !important;
-}
-.mic-compact .button-wrap {
-    margin: 6px auto !important;
-    padding: 8px 12px !important;
-    box-shadow: none !important;
-}
-.mic-compact .icon-with-text {
-    min-width: auto !important;
-    margin: 0 6px !important;
-    gap: 8px !important;
-}
-.mic-compact button[aria-label="select input source"],
-.mic-compact .source-selection,
-.mic-compact .select-wrap {
-    display: none !important;
+.mic-compact button {
+    border-radius: 8px !important;
 }
 .status-card {
     display: grid;
@@ -363,21 +285,6 @@ html.dark .gradio-container,
 @media (max-width: 820px) {
     .status-card { grid-template-columns: 1fr; }
 }
-
-/* Backstop for full_screen=False: if the FastRTC audio widget still toggles a
-   full-screen class, keep it inline so the controls/record button stay visible. */
-.audio-container.full-screen,
-.gradio-webrtc-waveContainer.full-screen,
-.wave-container.full-screen,
-.wave-svg.full-screen,
-.button-wrap.full-screen {
-    position: relative !important;
-    top: auto !important;
-    left: auto !important;
-    width: 100% !important;
-    height: auto !important;
-    max-height: 280px !important;
-}
 """
 
 
@@ -389,7 +296,7 @@ def render_captions(
     direction: str = DEFAULTS["direction"],
     state: str = "ready",
 ) -> str:
-    """Build the caption scrollback: committed lines plus the in-progress interim line."""
+    """Render committed and interim captions."""
     del direction, state
     rows: list[str] = []
     if interim:
@@ -422,7 +329,7 @@ def render_status(
     committed: int = 0,
     detail: str = "Ready",
 ) -> str:
-    """Small status panel that makes the live system easier to follow while testing."""
+    """Render the stream status panel."""
     return (
         "<div class='status-card'>"
         "<div class='status-item'><span class='status-label'>State</span>"
@@ -458,14 +365,6 @@ def _normalise_audio_array(audio: np.ndarray) -> np.ndarray:
     return array.astype(np.float32, copy=False)
 
 
-def _frames_to_audio(frames: list[np.ndarray]) -> np.ndarray:
-    """Concatenate WebRTC frames into 1-D float32. WebRTC delivers int16; normalise it."""
-    parts = []
-    for arr in frames:
-        parts.append(to_mono(_normalise_audio_array(arr)))
-    return np.concatenate(parts) if parts else np.empty(0, dtype=np.float32)
-
-
 def _audio_input_to_float32(audio: tuple[int, np.ndarray] | None) -> tuple[int, np.ndarray]:
     if audio is None:
         return SAMPLE_RATE, np.empty(0, dtype=np.float32)
@@ -476,152 +375,227 @@ def _audio_input_to_float32(audio: tuple[int, np.ndarray] | None) -> tuple[int, 
 # --- transport adapter ------------------------------------------------------
 
 
-class CaptioningHandler(StreamHandler):
-    """FastRTC transport glue around a per-connection LiveSession.
+@dataclass
+class GradioStreamState:
+    session: LiveSession | None = None
+    applied: tuple[str, str, float, float] | None = None
+    reset_token: int = DEFAULTS["reset"]
+    chunks: int = 0
+    audio_seconds: float = 0.0
 
-    receive() just enqueues frames (must return fast); a worker thread drains them,
-    runs the pipeline, and queues rendered caption HTML that emit() hands back as an
-    AdditionalOutputs. Control values arrive per-connection via self.latest_args.
-    """
+    def reset_audio_stats(self) -> None:
+        self.chunks = 0
+        self.audio_seconds = 0.0
 
-    def __init__(self) -> None:
-        # Ask FastRTC to deliver mono 16 kHz so prepare() is a near no-op; we still
-        # pass the frame's own rate to feed() and resample defensively.
-        super().__init__("mono", input_sample_rate=SAMPLE_RATE)
-        self._in: queue.Queue[tuple[int, np.ndarray]] = queue.Queue()
-        self._out: queue.Queue[tuple[str, str]] = queue.Queue()
-        self._stop = threading.Event()
-        self._worker: threading.Thread | None = None
-        self._session: LiveSession | None = None
-        self._applied: tuple | None = None
-        self._reset_token = int(DEFAULTS["reset"])
 
-    def copy(self) -> "CaptioningHandler":
-        return CaptioningHandler()
+_STREAM_STATES: dict[str, GradioStreamState] = {}
+_STREAM_LOCK = threading.Lock()
 
-    def start_up(self) -> None:
-        self._worker = threading.Thread(target=self._run, daemon=True)
-        self._worker.start()
 
-    def receive(self, frame: tuple[int, np.ndarray]) -> None:
-        self._in.put(frame)
+def _new_stream_id() -> str:
+    return uuid4().hex
 
-    def emit(self):
-        try:
-            return AdditionalOutputs(*self._out.get_nowait())
-        except queue.Empty:
-            return None
 
-    def shutdown(self) -> None:
-        self._stop.set()
+def _get_stream_state(stream_id: str | None) -> tuple[str, GradioStreamState]:
+    stream_id = stream_id or _new_stream_id()
+    with _STREAM_LOCK:
+        state = _STREAM_STATES.setdefault(stream_id, GradioStreamState())
+    return stream_id, state
 
-    def _controls(self) -> tuple[str, str, float, float, int]:
-        # Prefer per-connection values from FastRTC latest_args. StreamHandler.set_args
-        # prefixes transport metadata (webrtc id / sentinel), so the controls are the TAIL.
-        values = getattr(self, "latest_args", None)
-        if isinstance(values, list) and len(values) >= 5 and values[-5] in DIRECTIONS:
-            raw_direction, raw_model, raw_pause, raw_max, raw_reset = values[-5:]
-            c = {"direction": raw_direction, "model": raw_model, "pause": raw_pause, "max": raw_max}
-            reset_token = _reset_value(raw_reset)
-        elif isinstance(values, list) and len(values) >= 4 and values[-4] in DIRECTIONS:
-            raw_direction, raw_model, raw_pause, raw_max = values[-4:]
-            c = {"direction": raw_direction, "model": raw_model, "pause": raw_pause, "max": raw_max}
-            reset_token = _reset_value(_LIVE_CONTROLS.get("reset"))
-        else:
-            # Fallback for non-stream contexts/tests where latest_args is absent.
-            c = _LIVE_CONTROLS
-            reset_token = _reset_value(c.get("reset"))
-        d = DEFAULTS
-        direction = _normalise_direction(c.get("direction"))
-        model = c.get("model") if c.get("model") in MODEL_SIZES else d["model"]
-        try:
-            pause, max_phrase = float(c.get("pause")), float(c.get("max"))
-        except (TypeError, ValueError):
-            pause, max_phrase = d["pause"], d["max"]
-        return direction, model, pause, max_phrase, reset_token
 
-    def _sync_session(self) -> tuple[str, str, float, float, int]:
-        """Create the session, or apply any UI control change since the last frame."""
-        direction, model_size, pause, max_phrase, reset_token = self._controls()
-        if reset_token != self._reset_token:
-            self._session = None
-            self._applied = None
-            self._reset_token = reset_token
-        if self._session is not None and (direction, model_size, pause, max_phrase) == self._applied:
-            return direction, model_size, pause, max_phrase, reset_token
-        src, tgt = DIRECTIONS[direction]
-        boundary = PhraseBoundaryConfig(normal_pause_seconds=pause, max_phrase_seconds=max_phrase)
-        if self._session is None:
-            self._session = LiveSession(get_asr(model_size), source_lang=src, target_lang=tgt, boundary=boundary)
-        else:
-            model_changed = model_size != self._applied[1] if self._applied else True
-            self._session.reconfigure(
-                source_lang=src,
-                target_lang=tgt,
-                boundary=boundary,
-                asr=get_asr(model_size) if model_changed else None,
+def _drop_stream_state(stream_id: str | None) -> None:
+    if stream_id:
+        with _STREAM_LOCK:
+            _STREAM_STATES.pop(stream_id, None)
+
+
+def _interim_model_size(model_size: str) -> str:
+    return model_size if model_size == LIVE_INTERIM_MODEL else LIVE_INTERIM_MODEL
+
+
+def _audio_duration_seconds(samples: np.ndarray, sample_rate: int) -> float:
+    if sample_rate <= 0 or samples.size == 0:
+        return 0.0
+    return float(samples.shape[0]) / float(sample_rate)
+
+
+def _stream_detail(
+    action: str,
+    samples: np.ndarray,
+    sample_rate: int,
+    state: GradioStreamState,
+) -> str:
+    seconds = _audio_duration_seconds(samples, sample_rate)
+    peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+    return (
+        f"{action} · chunk {seconds:.2f}s @ {sample_rate / 1000:.1f} kHz"
+        f" · peak {peak:.2f} · {state.chunks} chunks / {state.audio_seconds:.1f}s"
+    )
+
+
+def _normalise_stream_controls(
+    direction: str | None,
+    model_size: str | None,
+    pause: float | None,
+    max_phrase: float | None,
+    reset_token: int | None = None,
+) -> tuple[str, str, float, float, int]:
+    direction = _normalise_direction(direction)
+    model_size = model_size if model_size in MODEL_SIZES else DEFAULTS["model"]
+    try:
+        pause_value = float(pause)
+        max_phrase_value = float(max_phrase)
+    except (TypeError, ValueError):
+        pause_value = float(DEFAULTS["pause"])
+        max_phrase_value = float(DEFAULTS["max"])
+    return direction, model_size, pause_value, max_phrase_value, _reset_value(reset_token)
+
+
+def _sync_stream_session(
+    state: GradioStreamState,
+    direction: str,
+    model_size: str,
+    pause: float,
+    max_phrase: float,
+    reset_token: int,
+) -> LiveSession:
+    if reset_token != state.reset_token:
+        state.session = None
+        state.applied = None
+        state.reset_token = reset_token
+        state.reset_audio_stats()
+    if state.session is not None and state.applied == (direction, model_size, pause, max_phrase):
+        return state.session
+
+    src, tgt = DIRECTIONS[direction]
+    boundary = PhraseBoundaryConfig(normal_pause_seconds=pause, max_phrase_seconds=max_phrase)
+    interim_model_size = _interim_model_size(model_size)
+    if state.session is None:
+        state.session = LiveSession(
+            get_asr(model_size),
+            source_lang=src,
+            target_lang=tgt,
+            boundary=boundary,
+            interim_asr=get_asr(interim_model_size),
+            interim_every=LIVE_INTERIM_EVERY_SECONDS,
+        )
+    else:
+        model_changed = state.applied is None or model_size != state.applied[1]
+        state.session.reconfigure(
+            source_lang=src,
+            target_lang=tgt,
+            boundary=boundary,
+            asr=get_asr(model_size) if model_changed else None,
+            interim_asr=get_asr(interim_model_size) if model_changed else None,
+            interim_every=LIVE_INTERIM_EVERY_SECONDS,
+        )
+    state.applied = (direction, model_size, pause, max_phrase)
+    return state.session
+
+
+def _stream_audio(
+    audio: tuple[int, np.ndarray] | None,
+    stream_id: str | None,
+    direction: str,
+    model_size: str,
+    pause: float,
+    max_phrase: float,
+    reset_token: int,
+) -> tuple[str, str, str]:
+    stream_id, state = _get_stream_state(stream_id)
+    direction, model_size, pause, max_phrase, reset_token = _normalise_stream_controls(
+        direction, model_size, pause, max_phrase, reset_token
+    )
+    sample_rate, samples = _audio_input_to_float32(audio)
+    if samples.size == 0:
+        return (
+            render_captions(state.session.captions.interim, state.session.captions.committed, direction=direction)
+            if state.session
+            else render_captions("", (), direction=direction),
+            render_status("listening", direction=direction, model_size=model_size, detail="Waiting for microphone audio."),
+            stream_id,
+        )
+
+    state.chunks += 1
+    state.audio_seconds += _audio_duration_seconds(samples, sample_rate)
+    try:
+        session = _sync_stream_session(state, direction, model_size, pause, max_phrase, reset_token)
+        update = session.feed(samples, sample_rate)
+    except FileNotFoundError as exc:
+        logger.warning("required translation model unavailable; resetting stream: %s", exc)
+        _drop_stream_state(stream_id)
+        return (
+            render_captions("", (), direction=direction, state="error"),
+            render_status("missing model", direction=direction, model_size=model_size, detail=str(exc)),
+            _new_stream_id(),
+        )
+    except Exception:
+        logger.exception("pipeline error; dropping this streamed audio chunk")
+        return (
+            render_captions(
+                state.session.captions.interim,
+                state.session.captions.committed,
+                direction=direction,
+                state="error",
             )
-        self._applied = (direction, model_size, pause, max_phrase)
-        return direction, model_size, pause, max_phrase, reset_token
+            if state.session
+            else render_captions("", (), direction=direction, state="error"),
+            render_status(
+                "error",
+                direction=direction,
+                model_size=model_size,
+                detail=_stream_detail("Pipeline error; chunk dropped", samples, sample_rate, state),
+            ),
+            stream_id,
+        )
 
-    def _run(self) -> None:
-        while not self._stop.is_set():
-            try:
-                sample_rate, first = self._in.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            frames = [first]
-            while True:  # drain whatever else queued up, to stay at the live edge
-                try:
-                    frames.append(self._in.get_nowait()[1])
-                except queue.Empty:
-                    break
-            direction = DEFAULTS["direction"]
-            model_size = DEFAULTS["model"]
-            try:
-                direction, model_size, *_ = self._sync_session()
-                update = self._session.feed(_frames_to_audio(frames), sample_rate)
-            except FileNotFoundError as exc:
-                logger.warning("required translation model unavailable; resetting session: %s", exc)
-                self._session = None
-                self._applied = None
-                self._out.put(
-                    (
-                        render_captions("", (), direction=direction, state="error"),
-                        render_status("missing model", direction=direction, model_size=model_size, detail=str(exc)),
-                    )
-                )
-                continue
-            except Exception:
-                logger.exception("pipeline error; dropping this chunk")
-                self._out.put(
-                    (
-                        render_captions("", (), state="error"),
-                        render_status("error", detail="Pipeline error; this chunk was dropped."),
-                    )
-                )
-                continue
-            if update is not None:
-                self._out.put(
-                    (
-                        render_captions(update.interim, update.committed, direction=direction, state="listening"),
-                        render_status(
-                            "listening",
-                            direction=direction,
-                            model_size=model_size,
-                            committed=len(update.committed),
-                            detail=f"Updated from {len(frames)} audio frame(s).",
-                        ),
-                    )
-                )
+    committed = session.captions.committed
+    return (
+        render_captions(session.captions.interim, committed, direction=direction, state="listening"),
+        render_status(
+            "listening",
+            direction=direction,
+            model_size=model_size,
+            committed=len(committed),
+            detail=_stream_detail("Updated" if update else "Listening", samples, sample_rate, state),
+        ),
+        stream_id,
+    )
+
+
+def _flush_stream(
+    stream_id: str | None,
+    direction: str,
+    model_size: str,
+    pause: float,
+    max_phrase: float,
+    reset_token: int,
+) -> tuple[str, str, str]:
+    stream_id, state = _get_stream_state(stream_id)
+    direction, model_size, pause, max_phrase, reset_token = _normalise_stream_controls(
+        direction, model_size, pause, max_phrase, reset_token
+    )
+    if state.session is None:
+        return (
+            render_captions("", (), direction=direction),
+            render_status("stopped", direction=direction, model_size=model_size, detail="Microphone stopped."),
+            stream_id,
+        )
+    try:
+        session = _sync_stream_session(state, direction, model_size, pause, max_phrase, reset_token)
+        flush_seconds = max(1.0, pause + 0.5)
+        session.feed(np.zeros(int(SAMPLE_RATE * flush_seconds), dtype=np.float32), SAMPLE_RATE)
+    except Exception:
+        logger.exception("pipeline error while flushing stream")
+    committed = state.session.captions.committed
+    return (
+        render_captions(state.session.captions.interim, committed, direction=direction, state="stopped"),
+        render_status("stopped", direction=direction, model_size=model_size, committed=len(committed), detail="Microphone stopped."),
+        stream_id,
+    )
 
 
 # --- UI ---------------------------------------------------------------------
-
-
-def _push_outputs(captions_html: str, status_html: str) -> tuple[str, str]:
-    """on_additional_outputs callback: route handler HTML to the visible panels."""
-    return captions_html, status_html
 
 
 def _reset_view(
@@ -630,14 +604,17 @@ def _reset_view(
     model: str,
     pause: float,
     max_phrase: float,
-) -> tuple[int, str, str]:
-    direction = _normalise_direction(direction)
+    stream_id: str | None = None,
+) -> tuple[int, str, str, str]:
+    direction, model, _, _, _ = _normalise_stream_controls(direction, model, pause, max_phrase)
+    _drop_stream_state(stream_id)
+    new_stream_id = _new_stream_id()
     new_token = _reset_value(reset_token) + 1
-    _apply_controls(direction, model, pause, max_phrase, new_token)
     return (
         new_token,
         render_captions("", (), direction=direction, state="ready"),
         render_status("reset", direction=direction, model_size=model, committed=0, detail="Caption history cleared."),
+        new_stream_id,
     )
 
 
@@ -648,22 +625,16 @@ def replay_file(
     pause: float,
     max_phrase: float,
 ) -> tuple[str, str]:
-    """Run an uploaded file through the same LiveSession core as the live stream."""
+    """Run an uploaded file through the captioning pipeline."""
     if audio is None:
         return (
             render_captions("", (), direction=direction, state="file"),
             render_status("file", direction=direction, model_size=model_size, detail="No audio file selected."),
         )
 
-    direction = _normalise_direction(direction)
-    if model_size not in MODEL_SIZES:
-        model_size = DEFAULTS["model"]
-    try:
-        pause = float(pause)
-        max_phrase = float(max_phrase)
-    except (TypeError, ValueError):
-        pause = float(DEFAULTS["pause"])
-        max_phrase = float(DEFAULTS["max"])
+    direction, model_size, pause, max_phrase, _ = _normalise_stream_controls(
+        direction, model_size, pause, max_phrase
+    )
 
     sample_rate, samples = _audio_input_to_float32(audio)
     prepared = prepare(samples, sample_rate)
@@ -714,6 +685,7 @@ def build_ui() -> gr.Blocks:
     default_direction = _normalise_direction(DEFAULTS["direction"])
     with gr.Blocks(css=CSS, title="Live Subtitles") as demo:
         reset_token = gr.State(value=DEFAULTS["reset"])
+        stream_id = gr.State(value=_new_stream_id, delete_callback=_drop_stream_state)
         gr.Markdown("# Live Subtitles", elem_classes=["app-title"])
         with gr.Row(equal_height=True, elem_classes=["app-shell"]):
             with gr.Column(scale=2, min_width=420, elem_classes=["caption-pane"]):
@@ -732,16 +704,17 @@ def build_ui() -> gr.Blocks:
                 )
             with gr.Column(scale=1, min_width=320, elem_classes=["control-rail"]):
                 gr.Markdown("### Live input", elem_classes=["rail-heading"])
-                webrtc = WebRTC(
-                    modality="audio",
-                    mode="send-receive",
-                    rtc_configuration=_rtc_configuration(),
+                live_audio = gr.Audio(
+                    sources=["microphone"],
+                    type="numpy",
+                    streaming=True,
                     label=None,
                     show_label=False,
-                    height=88,
+                    show_download_button=False,
+                    show_share_button=False,
+                    editable=False,
+                    waveform_options={"show_recording_waveform": False},
                     elem_classes=["mic-compact"],
-                    button_labels=MIC_BUTTON_LABELS,
-                    full_screen=False,
                 )
                 direction = gr.Dropdown(list(available_directions), value=default_direction, label="Direction")
                 model = gr.Dropdown(MODEL_SIZES, value=DEFAULTS["model"], label="ASR model")
@@ -753,17 +726,12 @@ def build_ui() -> gr.Blocks:
                     file_audio = gr.Audio(label="Audio file", sources=["upload"], type="numpy")
                     run_file = gr.Button("Run file", variant="primary")
 
-        # Keep a shared fallback store via change events, and also pass controls through
-        # the stream input path so each connection gets authoritative per-stream values.
         control_inputs = [direction, model, pause, max_phrase, reset_token]
-        control_components = [direction, model, pause, max_phrase]
-        for component in control_components:
-            component.change(_apply_controls, inputs=control_inputs, outputs=None, queue=False, show_progress="hidden")
 
         reset.click(
             _reset_view,
-            inputs=[reset_token, direction, model, pause, max_phrase],
-            outputs=[reset_token, captions, status],
+            inputs=[reset_token, direction, model, pause, max_phrase, stream_id],
+            outputs=[reset_token, captions, status, stream_id],
             queue=False,
             show_progress="hidden",
         )
@@ -774,8 +742,23 @@ def build_ui() -> gr.Blocks:
             concurrency_limit=1,
             show_progress="minimal",
         )
-        webrtc.stream(fn=CaptioningHandler(), inputs=[webrtc, *control_inputs], outputs=[webrtc])
-        webrtc.on_additional_outputs(_push_outputs, outputs=[captions, status], queue=False, show_progress="hidden")
+        live_audio.stream(
+            _stream_audio,
+            inputs=[live_audio, stream_id, *control_inputs],
+            outputs=[captions, status, stream_id],
+            stream_every=LIVE_STREAM_EVERY_SECONDS,
+            time_limit=600,
+            concurrency_limit=1,
+            show_progress="hidden",
+        )
+        live_audio.stop_recording(
+            _flush_stream,
+            inputs=[stream_id, *control_inputs],
+            outputs=[captions, status, stream_id],
+            queue=True,
+            concurrency_limit=1,
+            show_progress="hidden",
+        )
     return demo
 
 
@@ -783,7 +766,10 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
     ensure_mt_models()
     get_asr(DEFAULTS["model"])  # warm the default so the first phrase isn't slow
-    launch_kwargs = {"server_name": os.environ.get("GRADIO_SERVER_NAME", "127.0.0.1")}
+    if _interim_model_size(DEFAULTS["model"]) != DEFAULTS["model"]:
+        get_asr(_interim_model_size(DEFAULTS["model"]))
+    default_server_name = "0.0.0.0" if os.environ.get("SYSTEM") == "spaces" else "127.0.0.1"
+    launch_kwargs = {"server_name": os.environ.get("GRADIO_SERVER_NAME", default_server_name)}
     if port := os.environ.get("GRADIO_SERVER_PORT"):
         launch_kwargs["server_port"] = int(port)
     build_ui().launch(**launch_kwargs)
